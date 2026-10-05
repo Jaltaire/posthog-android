@@ -2,9 +2,21 @@ package com.posthog.android.replay
 
 import android.app.Activity
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
+import android.os.Handler
 import android.os.Looper
+import android.util.Base64
+import android.view.PixelCopy
+import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.View
 import android.view.Window
+import android.widget.FrameLayout
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.posthog.PostHogEvent
@@ -26,6 +38,9 @@ import com.posthog.internal.PostHogQueue
 import com.posthog.internal.PostHogQueueInterface
 import com.posthog.internal.PostHogRemoteConfig
 import com.posthog.internal.PostHogSessionManager
+import com.posthog.internal.replay.RREvent
+import com.posthog.internal.replay.RREventType
+import com.posthog.internal.replay.RRWireframe
 import org.junit.Rule
 import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
@@ -36,6 +51,9 @@ import org.mockito.kotlin.whenever
 import org.robolectric.Robolectric
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
+import org.robolectric.annotation.Implementation
+import org.robolectric.annotation.Implements
 import org.robolectric.shadows.ShadowPixelCopy
 import java.lang.ref.WeakReference
 import java.util.UUID
@@ -44,6 +62,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
@@ -1284,7 +1303,7 @@ internal class PostHogReplayIntegrationTest {
             .setInt(attachInfo, View.VISIBLE)
     }
 
-    private fun screenshotFixture(): Pair<RealQueueFixture, PostHogFake> {
+    private fun screenshotFixture(configure: PostHogSessionReplayConfig.() -> Unit = {}): Pair<RealQueueFixture, PostHogFake> {
         val fx =
             createIntegrationWithRealQueue(
                 flagActive = true,
@@ -1292,6 +1311,7 @@ internal class PostHogReplayIntegrationTest {
                 integrationContext = ApplicationProvider.getApplicationContext(),
             )
         fx.config.sessionReplayConfig.screenshot = true
+        fx.config.sessionReplayConfig.configure()
         val fake = PostHogFake()
         fx.sut.install(fake)
         fx.sut.start(resumeCurrent = true)
@@ -1341,6 +1361,617 @@ internal class PostHogReplayIntegrationTest {
             assertEquals("\$snapshot", fake.event)
         } finally {
             fx.sut.uninstall()
+        }
+    }
+
+    private class PaintedSurfaceView(
+        context: Context,
+        private val color: Int,
+    ) : SurfaceView(context) {
+        private val validSurface = mock<Surface> { on { isValid } doReturn true }
+
+        var surfaceHolder: SurfaceHolder? =
+            mock {
+                on { surface } doReturn validSurface
+            }
+
+        override fun getHolder(): SurfaceHolder? = surfaceHolder
+
+        override fun draw(canvas: Canvas) {
+            if (canvas.width == width && canvas.height == height) {
+                canvas.drawColor(color)
+            }
+        }
+    }
+
+    private class SurfaceScene(
+        val activity: Activity,
+        val decorView: View,
+        val surface: PaintedSurfaceView,
+        val cover: View,
+    )
+
+    private fun setWindowFocus(
+        decorView: View,
+        focused: Boolean,
+    ) {
+        val attachInfo =
+            View::class.java.getDeclaredField("mAttachInfo")
+                .apply { isAccessible = true }
+                .get(decorView)
+        attachInfo.javaClass.getDeclaredField("mHasWindowFocus")
+            .apply { isAccessible = true }
+            .setBoolean(attachInfo, focused)
+    }
+
+    private fun surfaceScene(
+        fx: RealQueueFixture,
+        focused: Boolean = true,
+    ): SurfaceScene {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val activity = controller.get()
+        activity.window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+        val root = FrameLayout(activity)
+        val surface = PaintedSurfaceView(activity, Color.RED)
+        root.addView(
+            surface,
+            FrameLayout.LayoutParams(80, 60).apply {
+                leftMargin = 20
+                topMargin = 30
+            },
+        )
+        val cover =
+            View(activity).apply {
+                setBackgroundColor(Color.BLUE)
+            }
+        root.addView(
+            cover,
+            FrameLayout.LayoutParams(20, 20).apply {
+                leftMargin = 20
+                topMargin = 30
+            },
+        )
+        activity.setContentView(root)
+        shadowOf(Looper.getMainLooper()).idle()
+        val decorView = activity.window.decorView
+        makeWindowVisible(decorView)
+        setWindowFocus(decorView, focused)
+        fx.sut.decorViews[decorView] = ViewTreeSnapshotStatus(mock<NextDrawListener>())
+        return SurfaceScene(activity, decorView, surface, cover)
+    }
+
+    private fun PostHogFake.capturedScreenshot(): Bitmap {
+        @Suppress("UNCHECKED_CAST")
+        val events = properties!!["\$snapshot_data"] as List<RREvent>
+        val fullSnapshot = events.single { it.type == RREventType.FullSnapshot }
+
+        @Suppress("UNCHECKED_CAST")
+        val wireframes = (fullSnapshot.data as Map<String, Any>)["wireframes"] as List<RRWireframe>
+        val base64 = wireframes.single().base64!!.substringAfter(",")
+        val bytes = Base64.decode(base64, Base64.DEFAULT)
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    }
+
+    private fun View.pixelAt(
+        screenshot: Bitmap,
+        dx: Int,
+        dy: Int,
+    ): Int {
+        val location = IntArray(2)
+        getLocationInWindow(location)
+        return screenshot.getPixel(location[0] + dx, location[1] + dy)
+    }
+
+    private fun assertColorNear(
+        expected: Int,
+        actual: Int,
+    ) {
+        val tolerance = 48
+        assertTrue(
+            Math.abs(Color.alpha(expected) - Color.alpha(actual)) <= tolerance &&
+                Math.abs(Color.red(expected) - Color.red(actual)) <= tolerance &&
+                Math.abs(Color.green(expected) - Color.green(actual)) <= tolerance &&
+                Math.abs(Color.blue(expected) - Color.blue(actual)) <= tolerance,
+            "Expected ${Integer.toHexString(expected)} but found ${Integer.toHexString(actual)}.",
+        )
+    }
+
+    private fun assertTransparent(actual: Int) {
+        assertTrue(Color.alpha(actual) <= 48, "Expected a transparent pixel but found ${Integer.toHexString(actual)}.")
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `captureSurfaceViews composites the surface beneath the window content`() {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = false
+                captureSurfaceViews = true
+            }
+        try {
+            val scene = surfaceScene(fx)
+
+            fx.sut.generateSnapshot(WeakReference(scene.decorView), WeakReference(scene.activity.window))
+
+            assertEquals(1, fake.captures)
+            val screenshot = fake.capturedScreenshot()
+            assertColorNear(Color.RED, scene.surface.pixelAt(screenshot, 60, 45))
+            assertColorNear(Color.BLUE, scene.surface.pixelAt(screenshot, 5, 5))
+            assertTransparent(scene.surface.pixelAt(screenshot, -10, 30))
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `screenshots leave the surface out unless captureSurfaceViews is set`() {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = false
+            }
+        try {
+            val scene = surfaceScene(fx)
+
+            fx.sut.generateSnapshot(WeakReference(scene.decorView), WeakReference(scene.activity.window))
+
+            assertEquals(1, fake.captures)
+            val screenshot = fake.capturedScreenshot()
+            assertTransparent(scene.surface.pixelAt(screenshot, 60, 45))
+            assertColorNear(Color.BLUE, scene.surface.pixelAt(screenshot, 5, 5))
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `maskAllImages leaves an uncaptured surface unmasked`() {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = true
+            }
+        try {
+            val scene = surfaceScene(fx)
+
+            fx.sut.generateSnapshot(WeakReference(scene.decorView), WeakReference(scene.activity.window))
+
+            assertEquals(1, fake.captures)
+            assertTransparent(scene.surface.pixelAt(fake.capturedScreenshot(), 60, 45))
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `maskAllImages masks a captured surface`() {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = true
+                captureSurfaceViews = true
+            }
+        try {
+            val scene = surfaceScene(fx)
+
+            fx.sut.generateSnapshot(WeakReference(scene.decorView), WeakReference(scene.activity.window))
+
+            assertEquals(1, fake.captures)
+            assertColorNear(Color.BLACK, scene.surface.pixelAt(fake.capturedScreenshot(), 60, 45))
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `a no-capture surface is masked even when images are not`() {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = false
+                captureSurfaceViews = true
+            }
+        try {
+            val scene = surfaceScene(fx)
+            scene.surface.tag = "ph-no-capture"
+
+            fx.sut.generateSnapshot(WeakReference(scene.decorView), WeakReference(scene.activity.window))
+
+            assertEquals(1, fake.captures)
+            assertColorNear(Color.BLACK, scene.surface.pixelAt(fake.capturedScreenshot(), 60, 45))
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `an unmasked surface stays visible when images are masked`() {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = true
+                captureSurfaceViews = true
+            }
+        try {
+            val scene = surfaceScene(fx)
+            scene.surface.tag = "ph-no-mask"
+
+            fx.sut.generateSnapshot(WeakReference(scene.decorView), WeakReference(scene.activity.window))
+
+            assertEquals(1, fake.captures)
+            assertColorNear(Color.RED, scene.surface.pixelAt(fake.capturedScreenshot(), 60, 45))
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `a surface without a valid buffer is left out of the frame`() {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = false
+                captureSurfaceViews = true
+            }
+        try {
+            val scene = surfaceScene(fx)
+            scene.surface.surfaceHolder = null
+
+            fx.sut.generateSnapshot(WeakReference(scene.decorView), WeakReference(scene.activity.window))
+
+            assertEquals(1, fake.captures)
+            assertTransparent(scene.surface.pixelAt(fake.capturedScreenshot(), 60, 45))
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `a hidden surface is left out of the frame`() {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = false
+                captureSurfaceViews = true
+            }
+        try {
+            val scene = surfaceScene(fx)
+            val location = IntArray(2)
+            scene.surface.getLocationInWindow(location)
+            scene.surface.visibility = View.INVISIBLE
+            shadowOf(Looper.getMainLooper()).idle()
+
+            fx.sut.generateSnapshot(WeakReference(scene.decorView), WeakReference(scene.activity.window))
+
+            assertEquals(1, fake.captures)
+            assertTransparent(fake.capturedScreenshot().getPixel(location[0] + 60, location[1] + 45))
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ShadowFailingSurfacePixelCopy::class])
+    fun `a failed surface copy discards the frame`() {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = false
+                captureSurfaceViews = true
+            }
+        try {
+            val scene = surfaceScene(fx)
+
+            fx.sut.generateSnapshot(WeakReference(scene.decorView), WeakReference(scene.activity.window))
+
+            assertEquals(0, fake.captures)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ShadowSilentSurfacePixelCopy::class])
+    fun `a surface copy that never finishes discards the frame`() {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = false
+                captureSurfaceViews = true
+            }
+        try {
+            val scene = surfaceScene(fx)
+
+            fx.sut.generateSnapshot(WeakReference(scene.decorView), WeakReference(scene.activity.window))
+
+            assertEquals(0, fake.captures)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ShadowThrowingSurfacePixelCopy::class])
+    fun `a rejected surface copy discards the frame`() {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = false
+                captureSurfaceViews = true
+            }
+        try {
+            val scene = surfaceScene(fx)
+
+            fx.sut.generateSnapshot(WeakReference(scene.decorView), WeakReference(scene.activity.window))
+
+            assertEquals(0, fake.captures)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    private fun periodicFixture(
+        intervalMs: Long?,
+        focused: Boolean = true,
+    ): Triple<RealQueueFixture, PostHogFake, SurfaceScene> {
+        val (fx, fake) =
+            screenshotFixture {
+                maskAllImages = false
+                captureIntervalMs = intervalMs
+            }
+        val scene = surfaceScene(fx, focused)
+        return Triple(fx, fake, scene)
+    }
+
+    private fun advanceMainLooper(milliseconds: Long) {
+        shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(milliseconds))
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `captureIntervalMs captures the focused window without any draw`() {
+        val (fx, fake, scene) = periodicFixture(intervalMs = 100)
+        try {
+            assertTrue(scene.decorView.hasWindowFocus())
+            assertEquals(0, fake.captures)
+
+            advanceMainLooper(100)
+            awaitCondition { fake.captures == 1 }
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `captureIntervalMs keeps capturing on its interval`() {
+        val (fx, fake, scene) = periodicFixture(intervalMs = 100)
+        try {
+            advanceMainLooper(100)
+            awaitCondition { fake.captures == 1 }
+            scene.cover.setBackgroundColor(Color.GREEN)
+            shadowOf(Looper.getMainLooper()).idle()
+
+            awaitCondition {
+                advanceMainLooper(100)
+                fake.captures == 2
+            }
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `no periodic capture runs without captureIntervalMs`() {
+        val (fx, fake, _) = periodicFixture(intervalMs = null)
+        try {
+            advanceMainLooper(1_000)
+            awaitReplayExecutors()
+
+            assertEquals(0, fake.captures)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `periodic capture skips windows without focus`() {
+        val (fx, fake, scene) = periodicFixture(intervalMs = 100, focused = false)
+        try {
+            assertFalse(scene.decorView.hasWindowFocus())
+
+            advanceMainLooper(500)
+            awaitReplayExecutors()
+            Thread.sleep(200)
+
+            assertEquals(0, fake.captures)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `stop cancels periodic capture`() {
+        val (fx, fake, _) = periodicFixture(intervalMs = 100)
+        try {
+            fx.sut.stop()
+
+            advanceMainLooper(500)
+            Thread.sleep(200)
+
+            assertEquals(0, fake.captures)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `uninstall cancels periodic capture`() {
+        val (fx, fake, _) = periodicFixture(intervalMs = 100)
+        fx.sut.uninstall()
+
+        advanceMainLooper(500)
+        Thread.sleep(200)
+
+        assertEquals(0, fake.captures)
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `clearing captureIntervalMs stops periodic capture after the next tick`() {
+        val (fx, fake, _) = periodicFixture(intervalMs = 100)
+        try {
+            fx.config.sessionReplayConfig.captureIntervalMs = null
+
+            advanceMainLooper(500)
+            Thread.sleep(200)
+
+            assertEquals(0, fake.captures)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ShadowHeldWindowPixelCopy::class])
+    fun `periodic capture waits for the previous capture to finish`() {
+        ShadowHeldWindowPixelCopy.requests.set(0)
+        val (fx, _, _) = periodicFixture(intervalMs = 100)
+        try {
+            advanceMainLooper(100)
+            awaitCondition { ShadowHeldWindowPixelCopy.requests.get() == 1 }
+
+            advanceMainLooper(300)
+            Thread.sleep(100)
+            assertEquals(1, ShadowHeldWindowPixelCopy.requests.get())
+
+            awaitCondition(timeoutMs = 4_000) {
+                advanceMainLooper(100)
+                ShadowHeldWindowPixelCopy.requests.get() == 2
+            }
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+}
+
+private fun copyWindowInSoftware(
+    source: Window,
+    dest: Bitmap,
+    listener: PixelCopy.OnPixelCopyFinishedListener,
+    listenerThread: Handler,
+) {
+    val decorView = source.decorView
+    val rendered = Bitmap.createBitmap(decorView.width, decorView.height, Bitmap.Config.ARGB_8888)
+    decorView.draw(Canvas(rendered))
+    Canvas(dest).drawBitmap(rendered, null, android.graphics.Rect(0, 0, dest.width, dest.height), null)
+    listenerThread.post { listener.onPixelCopyFinished(PixelCopy.SUCCESS) }
+}
+
+@Implements(PixelCopy::class)
+internal class ShadowFailingSurfacePixelCopy {
+    companion object {
+        @JvmStatic
+        @Implementation
+        fun request(
+            source: Window,
+            dest: Bitmap,
+            listener: PixelCopy.OnPixelCopyFinishedListener,
+            listenerThread: Handler,
+        ) {
+            copyWindowInSoftware(source, dest, listener, listenerThread)
+        }
+
+        @JvmStatic
+        @Implementation
+        fun request(
+            source: SurfaceView,
+            dest: Bitmap,
+            listener: PixelCopy.OnPixelCopyFinishedListener,
+            listenerThread: Handler,
+        ) {
+            listenerThread.post { listener.onPixelCopyFinished(PixelCopy.ERROR_SOURCE_INVALID) }
+        }
+    }
+}
+
+@Implements(PixelCopy::class)
+internal class ShadowSilentSurfacePixelCopy {
+    companion object {
+        @JvmStatic
+        @Implementation
+        fun request(
+            source: Window,
+            dest: Bitmap,
+            listener: PixelCopy.OnPixelCopyFinishedListener,
+            listenerThread: Handler,
+        ) {
+            copyWindowInSoftware(source, dest, listener, listenerThread)
+        }
+
+        @JvmStatic
+        @Implementation
+        fun request(
+            source: SurfaceView,
+            dest: Bitmap,
+            listener: PixelCopy.OnPixelCopyFinishedListener,
+            listenerThread: Handler,
+        ) {
+        }
+    }
+}
+
+@Implements(PixelCopy::class)
+internal class ShadowThrowingSurfacePixelCopy {
+    companion object {
+        @JvmStatic
+        @Implementation
+        fun request(
+            source: Window,
+            dest: Bitmap,
+            listener: PixelCopy.OnPixelCopyFinishedListener,
+            listenerThread: Handler,
+        ) {
+            copyWindowInSoftware(source, dest, listener, listenerThread)
+        }
+
+        @JvmStatic
+        @Implementation
+        fun request(
+            source: SurfaceView,
+            dest: Bitmap,
+            listener: PixelCopy.OnPixelCopyFinishedListener,
+            listenerThread: Handler,
+        ) {
+            throw IllegalArgumentException("The surface is not valid.")
+        }
+    }
+}
+
+@Implements(PixelCopy::class)
+internal class ShadowHeldWindowPixelCopy {
+    companion object {
+        val requests = AtomicInteger()
+
+        @JvmStatic
+        @Implementation
+        fun request(
+            source: Window,
+            dest: Bitmap,
+            listener: PixelCopy.OnPixelCopyFinishedListener,
+            listenerThread: Handler,
+        ) {
+            requests.incrementAndGet()
         }
     }
 }

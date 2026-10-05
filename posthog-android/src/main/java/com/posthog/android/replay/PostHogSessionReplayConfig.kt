@@ -59,12 +59,21 @@ public class PostHogSessionReplayConfig
          * Defaults to `null`.
          */
         public var sampleRate: Double? = null,
+        public var captureSurfaceViews: Boolean = false,
+        captureIntervalMs: Long? = null,
     ) {
+        public var captureIntervalMs: Long? = null
+            set(value) {
+                require(value == null || value > 0) { "The session replay capture interval must be positive." }
+                field = value
+            }
+
         init {
             // for keeping back compatibility
             @Suppress("DEPRECATION")
             if (debouncerDelayMs != 1000L) {
                 throttleDelayMs = debouncerDelayMs
             }
+            this.captureIntervalMs = captureIntervalMs
         }
     }

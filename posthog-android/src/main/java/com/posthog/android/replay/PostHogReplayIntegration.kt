@@ -9,6 +9,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Point
 import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
@@ -28,6 +29,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.PixelCopy
+import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
@@ -96,6 +98,8 @@ import java.util.WeakHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 public class PostHogReplayIntegration(
     private val context: Context,
@@ -154,6 +158,21 @@ public class PostHogReplayIntegration(
         Paint().apply {
             color = Color.BLACK
         }
+
+    private val surfacePaint =
+        Paint().apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OVER)
+        }
+
+    private class SurfaceCopy(
+        val bitmap: Bitmap,
+        val source: Rect,
+        val destination: Rect,
+    )
+
+    private val periodicCapturePending = AtomicBoolean(false)
+
+    private val periodicCapture = Runnable { capturePeriodically() }
 
     // Reusable objects to avoid per-view allocations during screenshot masking.
     // Only accessed from the PixelCopy callback thread (or executor), so no synchronization needed.
@@ -478,6 +497,7 @@ public class PostHogReplayIntegration(
             replaySessionId = null
 
             Curtains.onRootViewsChangedListeners -= onRootViewsChangedListener
+            mainHandler.handler.removeCallbacks(periodicCapture)
 
             // Snapshot first: clearViewListeners removes entries, which would structurally
             // modify the map mid-iteration.
@@ -870,6 +890,14 @@ public class PostHogReplayIntegration(
                 }
             }
 
+            view is SurfaceView && config.sessionReplayConfig.captureSurfaceViews -> {
+                if (config.sessionReplayConfig.maskAllImages) {
+                    view.globalVisibleRect()?.let {
+                        maskableWidgets.add(it)
+                    }
+                }
+            }
+
             view is ViewGroup && view.childCount > 0 -> {
                 walkChildren = true
             }
@@ -1030,6 +1058,16 @@ public class PostHogReplayIntegration(
         var success = true
         val handler = ensurePixelCopyHandler()
 
+        val surfaceCopies =
+            if (config.sessionReplayConfig.captureSurfaceViews) {
+                copySurfaceViews(view, handler) ?: run {
+                    bitmap.recycle()
+                    return null
+                }
+            } else {
+                emptyList()
+            }
+
         // Track whether the PixelCopy callback has finished to avoid recycling the bitmap
         // while the callback is still using it (e.g. if latch.await times out).
         // We use the latch itself as the synchronization mechanism (await happens-before countDown)
@@ -1067,6 +1105,10 @@ public class PostHogReplayIntegration(
                                         success = false
                                         return@request
                                     }
+
+                                surfaceCopies.forEach {
+                                    canvas.drawBitmap(it.bitmap, it.source, it.destination, surfacePaint)
+                                }
 
                                 maskableWidgets.forEach {
                                     if (isOnDrawnCalled && !isOnlyAnimationRedraw) {
@@ -1123,6 +1165,9 @@ public class PostHogReplayIntegration(
             if (callbackCompleted && !bitmap.isRecycled) {
                 bitmap.recycle()
             }
+            surfaceCopies.forEach {
+                it.bitmap.recycle()
+            }
         }
 
         // A discarded capture (PixelCopy failure, or a redraw race that
@@ -1144,6 +1189,111 @@ public class PostHogReplayIntegration(
             base64 = base64,
             style = RRStyle(),
         )
+    }
+
+    private fun View.findVisibleSurfaceViews(surfaces: MutableList<SurfaceView>) {
+        if (!isVisible()) {
+            return
+        }
+        when (this) {
+            is SurfaceView -> surfaces.add(this)
+            is ViewGroup -> {
+                for (i in 0 until childCount) {
+                    getChildAt(i)?.findVisibleSurfaceViews(surfaces)
+                }
+            }
+        }
+    }
+
+    @SuppressLint("NewApi")
+    private fun copySurfaceViews(
+        view: View,
+        handler: Handler,
+    ): List<SurfaceCopy>? {
+        val surfaces = mutableListOf<SurfaceView>()
+        view.findVisibleSurfaceViews(surfaces)
+
+        val origin = IntArray(2)
+        view.getLocationInWindow(origin)
+
+        val copies = mutableListOf<SurfaceCopy>()
+        for (surface in surfaces) {
+            if (surface.holder?.surface?.isValid != true) {
+                continue
+            }
+            val visible = surface.globalVisibleRect() ?: continue
+            val location = IntArray(2)
+            surface.getLocationInWindow(location)
+            val source = Rect(visible).apply { offset(-location[0], -location[1]) }
+            val destination = Rect(visible).apply { offset(-origin[0], -origin[1]) }
+
+            val surfaceBitmap = Bitmap.createBitmap(surface.width, surface.height, Bitmap.Config.ARGB_8888)
+            val latch = CountDownLatch(1)
+            val result = AtomicInteger(PixelCopy.ERROR_TIMEOUT)
+            try {
+                PixelCopy.request(surface, surfaceBitmap, { copyResult ->
+                    result.set(copyResult)
+                    latch.countDown()
+                }, handler)
+            } catch (e: Throwable) {
+                config.logger.log("Session Replay SurfaceView PixelCopy failed: $e.")
+                surfaceBitmap.recycle()
+                copies.forEach { it.bitmap.recycle() }
+                return null
+            }
+
+            val completed =
+                try {
+                    latch.await(1000, TimeUnit.MILLISECONDS)
+                } catch (e: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    false
+                }
+            if (!completed) {
+                config.logger.log("Session Replay SurfaceView PixelCopy timed out.")
+                copies.forEach { it.bitmap.recycle() }
+                return null
+            }
+            if (result.get() != PixelCopy.SUCCESS) {
+                config.logger.log("Session Replay SurfaceView PixelCopy failed: ${result.get()}.")
+                surfaceBitmap.recycle()
+                copies.forEach { it.bitmap.recycle() }
+                return null
+            }
+            copies.add(SurfaceCopy(surfaceBitmap, source, destination))
+        }
+        return copies
+    }
+
+    private fun capturePeriodically() {
+        val interval = config.sessionReplayConfig.captureIntervalMs ?: return
+        mainHandler.handler.postDelayed(periodicCapture, interval)
+
+        if (!isActive() || !isNativeSdk) {
+            return
+        }
+        val decorView = synchronized(decorViews) { decorViews.keys.firstOrNull { it.hasWindowFocus() } } ?: return
+        val window = decorView.phoneWindow ?: return
+        if (!periodicCapturePending.compareAndSet(false, true)) {
+            return
+        }
+
+        val viewRef = WeakReference(decorView)
+        val windowRef = WeakReference(window)
+        try {
+            executor.submit {
+                try {
+                    generateSnapshot(viewRef, windowRef)
+                } catch (e: Throwable) {
+                    config.logger.log("Session Replay generateSnapshot failed: $e.")
+                } finally {
+                    periodicCapturePending.set(false)
+                }
+            }
+        } catch (e: Throwable) {
+            periodicCapturePending.set(false)
+            config.logger.log("Session Replay periodic capture failed: $e.")
+        }
     }
 
     private fun ImageView.shouldMaskImage(ancestorUnmasked: Boolean = false): Boolean {
@@ -1695,6 +1845,11 @@ public class PostHogReplayIntegration(
 
         isSessionReplayActive = true
 
+        mainHandler.handler.removeCallbacks(periodicCapture)
+        config.sessionReplayConfig.captureIntervalMs?.let {
+            mainHandler.handler.postDelayed(periodicCapture, it)
+        }
+
         if (!resumeCurrent) {
             // Without this, on a static UI the first user-driven onDraw can be tens of seconds
             // away — and incremental events (type:3) would ship under the new session before
@@ -1718,6 +1873,7 @@ public class PostHogReplayIntegration(
 
     override fun stop() {
         isSessionReplayActive = false
+        mainHandler.handler.removeCallbacks(periodicCapture)
         isOnDrawnCalled = false
         isOnlyAnimationRedraw = false
     }
