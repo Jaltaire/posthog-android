@@ -71,11 +71,13 @@ internal class PostHogTest {
         personProfiles: PersonProfiles = PersonProfiles.IDENTIFIED_ONLY,
         exceptionStepsEnabled: Boolean = true,
         exceptionStepsMaxBytes: Int = 32768,
+        flushIntervalSeconds: Int = PostHogConfig.DEFAULT_FLUSH_INTERVAL_SECONDS,
     ): PostHogInterface {
         config =
             PostHogConfig(API_KEY, host).apply {
                 // for testing
                 this.flushAt = flushAt
+                this.flushIntervalSeconds = flushIntervalSeconds
                 this.storagePrefix = File(storagePrefix, "events").absolutePath
                 this.replayStoragePrefix = File(storagePrefix, "snapshots").absolutePath
                 this.optOut = optOut
@@ -2085,6 +2087,53 @@ internal class PostHogTest {
         assertNotNull(newSessionId)
 
         assertTrue(currentSessionId != newSessionId)
+
+        sut.close()
+    }
+
+    @Test
+    fun `replay queue sends snapshots on its flush interval below flushAt`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut =
+            getSut(
+                url.toString(),
+                flushAt = 10,
+                preloadFeatureFlags = false,
+                reloadFeatureFlags = false,
+                flushIntervalSeconds = 1,
+            )
+
+        sut.capture("\$snapshot", DISTINCT_ID, props)
+
+        val request = http.takeRequest(5, java.util.concurrent.TimeUnit.SECONDS)
+
+        assertNotNull(request)
+        assertEquals(config.snapshotEndpoint, request.path)
+        val batch = serializer.deserialize<List<PostHogEvent>>(request.body.unGzip().reader())
+        assertEquals("\$snapshot", batch.single().event)
+
+        sut.close()
+    }
+
+    @Test
+    fun `replay queue holds snapshots below flushAt until its flush interval`() {
+        val http = mockHttp()
+        val url = http.url("/")
+
+        val sut =
+            getSut(
+                url.toString(),
+                flushAt = 10,
+                preloadFeatureFlags = false,
+                reloadFeatureFlags = false,
+            )
+
+        sut.capture("\$snapshot", DISTINCT_ID, props)
+        replayQueueExecutor.awaitExecution()
+
+        assertNull(http.takeRequest(1500, java.util.concurrent.TimeUnit.MILLISECONDS))
 
         sut.close()
     }

@@ -269,6 +269,7 @@ public class PostHog private constructor(
                 getDeviceId()
 
                 queue.start()
+                replayQueue.start()
                 logsQueue.start()
 
                 PostHogSessionManager.setOnSessionIdChangedListener {
